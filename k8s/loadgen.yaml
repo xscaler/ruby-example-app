@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-loadgen
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: example-loadgen
+    app.kubernetes.io/part-of: ruby-example-app
+spec:
+  # Scale to 0 to pause the load without deleting anything.
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: example-loadgen
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: example-loadgen
+        app.kubernetes.io/part-of: ruby-example-app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: curl
+          image: curlimages/curl:8.11.1
+          env:
+            - name: TARGET
+              value: http://example-frontend.ruby-test.svc.cluster.local
+            # Seconds between requests. Raise it to cut trace volume.
+            - name: INTERVAL
+              value: "2"
+          # No $RANDOM in busybox sh, so the route mix is driven by a counter.
+          # Ten-step cycle: mostly healthy orders, with periodic latency,
+          # a cross-service error and a frontend-only error mixed in.
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              while true; do
+                case $((i % 10)) in
+                  0|1|2|3|4) path="/order/widget-$((i % 5))" ;;
+                  5)         path="/checkout/widget-1?qty=2" ;;
+                  6)         path="/slow-path?ms=$(( (i % 4) * 100 + 60 ))" ;;
+                  7)         path="/hello/loadgen" ;;
+                  8)         path="/checkout/widget-1?qty=11" ;;
+                  9)         path="/fail" ;;
+                esac
+                code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${TARGET}${path}")
+                echo "$(date -u +%H:%M:%S) ${code} ${path}"
+                i=$((i + 1))
+                sleep "${INTERVAL}"
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

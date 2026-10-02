@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-backend
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: example-backend
+    app.kubernetes.io/part-of: ruby-example-app
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: example-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: example-backend
+        app.kubernetes.io/part-of: ruby-example-app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          # Set your own registry before applying (see README).
+          # Immutable tag or digest, never :latest, so rollouts are reproducible.
+          image: <your-registry>/ruby-example-app:0.5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Same image as the frontend; APP_ROLE picks which app config.ru runs.
+            - name: APP_ROLE
+              value: backend
+            - name: PORT
+              value: "8080"
+            - name: APP_ENV
+              value: production
+            # --- MySQL ---
+            # Every query becomes a db.client span with the statement attached,
+            # so order traces reach three tiers: frontend -> backend -> mysql.
+            - name: MYSQL_HOST
+              value: mysql.ruby-test.svc.cluster.local
+            - name: MYSQL_PORT
+              value: "3306"
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: database
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: password
+            # --- OpenTelemetry ---
+            # The gem is baked into the image and preloaded via RUBYOPT in the
+            # image CMD; these only configure where spans go.
+            - name: OTEL_SERVICE_NAME
+              value: example-backend
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              # Signal-specific on purpose. The bare OTEL_EXPORTER_OTLP_ENDPOINT
+              # gets a default path appended and fails with an opaque 403.
+              value: https://euw1-01.t.xscalerlabs.com/otlp/v1/traces
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef:
+                  name: otel-xscaler
+                  key: headers
+            # Drop probe traffic. The probes hit /health every 5-10s per pod,
+            # which would otherwise dominate trace volume with no diagnostic
+            # value. Format is ';'-separated key=value, arrays comma-separated.
+            - name: OTEL_RUBY_INSTRUMENTATION_RACK_CONFIG_OPTS
+              value: untraced_endpoints=/health
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME),k8s.cluster.name=xscaler-prod-edge-euw1-01
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Needed because the root filesystem is read-only; Rack/Puma use /tmp.
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: example-backend
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: example-backend
+    app.kubernetes.io/part-of: ruby-example-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: example-backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

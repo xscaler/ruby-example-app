@@ -1,0 +1,60 @@
+services:
+  # One image, built from this directory, run twice with different roles.
+  frontend:
+    build:
+      context: .
+    image: ruby-example-app:local
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ROLE: frontend
+      APP_ENV: production
+      PORT: "8080"
+      BACKEND_BASE_URL: http://backend:8080
+      # Swap to otlp plus an endpoint to ship these somewhere real.
+      OTEL_TRACES_EXPORTER: console
+    depends_on:
+      - backend
+
+  backend:
+    # Same build as the frontend (cached, so it costs nothing) — without this,
+    # `docker compose build backend` is a silent no-op and you debug a stale image.
+    build:
+      context: .
+    image: ruby-example-app:local
+    ports:
+      - "8081:8080"
+    environment:
+      APP_ROLE: backend
+      APP_ENV: production
+      PORT: "8080"
+      OTEL_TRACES_EXPORTER: console
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: example
+      MYSQL_USER: example
+      MYSQL_PASSWORD: example
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootexample
+      MYSQL_DATABASE: example
+      MYSQL_USER: example
+      MYSQL_PASSWORD: example
+    # Trimmed from the ~1Gi an untuned MySQL 8 wants.
+    command:
+      - --innodb-buffer-pool-size=64M
+      - --performance-schema=OFF
+      - --max-connections=50
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uexample", "-pexample"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s

@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: ruby-example-app
+type: Opaque
+stringData:
+  # Example credentials for a throwaway namespace. For anything real, create
+  # this secret out-of-band instead of committing it.
+  database: example
+  username: example
+  password: example
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: ruby-example-app
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  strategy:
+    # Never run two MySQL pods against the same volume.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mysql
+        app.kubernetes.io/part-of: ruby-example-app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          args:
+            # Trimmed from the ~1Gi an untuned MySQL 8 wants.
+            - --innodb-buffer-pool-size=64M
+            - --performance-schema=OFF
+            - --max-connections=50
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            # The app connects as the unprivileged user; nothing needs root, so
+            # the root password is randomised and discarded.
+            - name: MYSQL_RANDOM_ROOT_PASSWORD
+              value: "1"
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: database
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          # First boot initialises the data directory, which can take a while;
+          # the startup probe is what stops liveness killing it mid-init.
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 --protocol=tcp -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\""]
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 --protocol=tcp -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 --protocol=tcp -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # Left writable on purpose: the mysql entrypoint writes to
+            # /var/run/mysqld and /tmp during init. Locking it down needs an
+            # emptyDir per path and buys little for a throwaway database.
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+      volumes:
+        # emptyDir: the data is disposable and the backend re-creates and
+        # re-seeds the schema on first query. Swap for a PVC to keep it.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: ruby-test
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: ruby-example-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
